@@ -13,6 +13,8 @@ local ewma = require("balancer.ewma")
 -- for an Nginx worker to pick up the new list of upstream peers
 -- it will take <the delay until controller POSTed the backend object to the Nginx endpoint> + BACKENDS_SYNC_INTERVAL
 local BACKENDS_SYNC_INTERVAL = 1
+local AGENT_CHECK_INTERVAL = 1
+
 
 local DEFAULT_LB_ALG = "round_robin"
 local IMPLEMENTATIONS = {
@@ -25,6 +27,7 @@ local IMPLEMENTATIONS = {
 
 local _M = {}
 local balancers = {}
+local agent_checks_info = {}
 
 local function get_implementation(backend)
   local name = backend["load-balance"] or DEFAULT_LB_ALG
@@ -73,10 +76,60 @@ local function format_ipv6_endpoints(endpoints)
   return formatted_endpoints
 end
 
+local agent_check
+agent_check = function(premature, backend)
+  if not agent_checks_info[backend.name] then
+    ngx.log(ngx.ERR, string.format("agent checks have not found for %s. Removing timer...", backend.name))
+    return
+  end
+  if not agent_checks_info[backend.name].endpoints or #agent_checks_info[backend.name].endpoints == 0 then
+    ngx.log(ngx.ERR, string.format("there is no endpoint for backend %s. Removing timer...", backend.name))
+    agent_checks_info[backend.name] = nil
+    return
+  end
+
+  local balancer = balancers[backend.name]
+  local socket = ngx.socket.tcp()
+  socket:settimeout(1000)
+
+  for _, endpoint in pairs(agent_checks_info[backend.name].endpoints) do
+    local endpoint_string = endpoint.address .. ":" .. endpoint.port
+    local ok, err = socket:connect(endpoint.address, agent_checks_info[backend.name].port)
+    if not ok then
+      ngx.log(ngx.ERR, string.format("failed to connect to %s:%s %s", endpoint.address, agent_checks_info[backend.name].port, err))
+      agent_checks_info[backend.name]["weights"][endpoint_string] = 100
+    else
+      local line, err, partial = socket:receive()
+      if not line then
+        ngx.log(ngx.ERR, string.format("failed to read a line: %s", err))
+      else
+        -- ngx.log(ngx.ERR, string.format("endpoint: %s line: %s", endpoint_string, line))
+        local percent = tonumber(line:match("(%d+)%%"))
+        if percent then
+          agent_checks_info[backend.name]["weights"][endpoint_string] = percent
+        else
+          agent_checks_info[backend.name]["weights"][endpoint_string] = 0
+        end
+      end
+      socket:close()
+    end
+  end
+  -- ngx.log(ngx.ERR, string.format("start timer from agent_check for backend %s, worker id = %s, agent_checks_info=%s", backend.name, ngx.worker.id(), cjson.encode(agent_checks_info)))
+
+  -- backend["agent_checks_weights"] = agent_checks_info[backend.name]["weights"]
+  -- if balancer then
+  --   balancer:sync(backend)
+  -- end
+
+  local timer, err = ngx.timer.at(AGENT_CHECK_INTERVAL * ngx.worker.count(), agent_check, backend)
+  agent_checks_info[backend.name].timer = timer
+end
+
 local function sync_backend(backend)
   if not backend.endpoints or #backend.endpoints == 0 then
     ngx.log(ngx.INFO, string.format("there is no endpoint for backend %s. Removing...", backend.name))
     balancers[backend.name] = nil
+    agent_checks_info[backend.name] = nil
     return
   end
 
@@ -105,6 +158,27 @@ local function sync_backend(backend)
 
   backend.endpoints = format_ipv6_endpoints(backend.endpoints)
 
+  for _, port in pairs(backend.service.spec.ports) do
+    if port.name == "agent-check" then
+      if not agent_checks_info[backend.name] then
+        agent_checks_info[backend.name] = {}
+        agent_checks_info[backend.name]["weights"] = {}
+      end
+      agent_checks_info[backend.name].port = port.targetPort
+    end
+  end
+
+  if agent_checks_info[backend.name] then
+    agent_checks_info[backend.name].endpoints = backend.endpoints
+    if not agent_checks_info[backend.name].timer then
+      -- ngx.log(ngx.ERR, string.format("start timer from backend_sync, worker id = %s, agent_checks_info = %s\n", ngx.worker.id(), cjson.encode(agent_checks_info)))
+      local worker_count = ngx.worker.count()
+      local offset = AGENT_CHECK_INTERVAL * (ngx.worker.id() or (math.random() * worker_count))
+      local timer, err = ngx.timer.at(offset, agent_check, backend)
+      agent_checks_info[backend.name].timer = timer
+    end
+    backend["agent_checks_weights"] = agent_checks_info[backend.name]["weights"]
+  end
   balancer:sync(backend)
 end
 
@@ -123,6 +197,7 @@ local function sync_backends()
 
   local balancers_to_keep = {}
   for _, new_backend in ipairs(new_backends) do
+    -- ngx.log(ngx.ERR, string.format("new_backend  = %s\n", cjson.encode(new_backend)))
     sync_backend(new_backend)
     balancers_to_keep[new_backend.name] = balancers[new_backend.name]
   end
@@ -130,6 +205,7 @@ local function sync_backends()
   for backend_name, _ in pairs(balancers) do
     if not balancers_to_keep[backend_name] then
       balancers[backend_name] = nil
+      agent_checks_info[backend_name] = nil
     end
   end
 end
@@ -230,7 +306,7 @@ function _M.balance()
   local peer = balancer:balance()
   if not peer then
     ngx.log(ngx.WARN, "no peer was returned, balancer: " .. balancer.name)
-    return
+    return ngx.exit(500)
   end
 
   ngx_balancer.set_more_tries(1)

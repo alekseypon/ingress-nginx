@@ -5,11 +5,30 @@ local _M = {}
 
 function _M.get_nodes(endpoints)
   local nodes = {}
-  local weight = 1
+  local weight = 200
 
   for _, endpoint in pairs(endpoints) do
     local endpoint_string = endpoint.address .. ":" .. endpoint.port
-    nodes[endpoint_string] = weight
+      nodes[endpoint_string] = weight
+  end
+
+  return nodes
+end
+
+function _M.get_nodes_weighted(endpoints, weights)
+  local nodes = {}
+  local weight = 200
+
+  for _, endpoint in pairs(endpoints) do
+    local endpoint_string = endpoint.address .. ":" .. endpoint.port
+      if weights[endpoint_string] ~= nil then
+        local weight_mod = weight * weights[endpoint_string] / 100
+        if weight_mod > 0 then
+          nodes[endpoint_string] = weight_mod
+        end
+      else
+        nodes[endpoint_string] = weight
+      end
   end
 
   return nodes

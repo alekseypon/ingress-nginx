@@ -8,6 +8,7 @@ local chash = require("balancer.chash")
 local chashsubset = require("balancer.chashsubset")
 local sticky = require("balancer.sticky")
 local ewma = require("balancer.ewma")
+local dynamic_round_robin = require("balancer.dynamic_round_robin")
 
 -- measured in seconds
 -- for an Nginx worker to pick up the new list of upstream peers
@@ -16,13 +17,14 @@ local BACKENDS_SYNC_INTERVAL = 1
 local AGENT_CHECK_INTERVAL = 1
 
 
-local DEFAULT_LB_ALG = "round_robin"
+local DEFAULT_LB_ALG = "dynamic_round_robin"
 local IMPLEMENTATIONS = {
   round_robin = round_robin,
   chash = chash,
   chashsubset = chashsubset,
   sticky = sticky,
   ewma = ewma,
+  dynamic_round_robin = dynamic_round_robin,
 }
 
 local _M = {}
@@ -306,7 +308,7 @@ function _M.balance()
   local peer = balancer:balance()
   if not peer then
     ngx.log(ngx.WARN, "no peer was returned, balancer: " .. balancer.name)
-    return ngx.exit(500)
+    return ngx.exit(503)
   end
 
   ngx_balancer.set_more_tries(1)
